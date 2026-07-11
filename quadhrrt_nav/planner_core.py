@@ -269,15 +269,16 @@ class QuadRRTPlanner:
         x1 = int((cx + cw - self.map.origin_x) / self.map.res)
         y1 = int((cy + ch - self.map.origin_y) / self.map.res)
 
-        # Clamp to map bounds
+        # Clamp to map bounds. obs_mask is [row=y, col=x], so shape[0]=h (y),
+        # shape[1]=w (x): clamp the x index against width, y index against height.
         x0 = max(0, x0);  y0 = max(0, y0)
-        x1 = min(obs_mask.shape[0] - 1, x1)
-        y1 = min(obs_mask.shape[1] - 1, y1)
+        x1 = min(obs_mask.shape[1] - 1, x1)
+        y1 = min(obs_mask.shape[0] - 1, y1)
 
         if x1 <= x0 or y1 <= y0:
             return 0.0
 
-        region = obs_mask[x0:x1, y0:y1]
+        region = obs_mask[y0:y1, x0:x1]
         return float(np.sum(region)) / float(region.size + 1e-6)
 
 
@@ -296,7 +297,7 @@ class QuadRRTPlanner:
             wx = sx + t * (gx - sx)
             wy = sy + t * (gy - sy)
             cx, cy = self.map.world_to_cell(wx, wy)
-            if self.map.in_bounds(cx, cy) and obs_mask[cx, cy]:
+            if self.map.in_bounds(cx, cy) and obs_mask[cy, cx]:
                 if not prev_hit:
                     nc += 1       # entering a new obstacle cluster
                 prev_hit = True
@@ -576,7 +577,7 @@ class QuadRRTPlanner:
 
         if not self.map.in_bounds(scx, scy):
             return []
-        if not self.map.in_bounds(gcx, gcy) or obs[gcx, gcy]:
+        if not self.map.in_bounds(gcx, gcy) or obs[gcy, gcx]:
             gcx, gcy = self._free_near(gcx, gcy, obs)
             if gcx is None:
                 return []
@@ -702,14 +703,69 @@ class QuadRRTPlanner:
 
 
     def _collision_free(self, x0, y0, x1, y1, obs):
-        """Check line segment for collisions using Bresenham."""
-        cx0, cy0 = self.map.world_to_cell(x0, y0)
-        cx1, cy1 = self.map.world_to_cell(x1, y1)
-        for cx, cy in self.map._bresenham(cx0, cy0, cx1, cy1):
+        """Check a segment for collisions with a conservative grid traversal.
+
+        Uses an Amanatides-Woo voxel walk over the CONTINUOUS segment, visiting
+        EVERY cell the segment passes through. Plain Bresenham cuts corners: on a
+        near-diagonal edge it can step diagonally across a grid vertex and skip
+        the two cells sharing that corner, letting a path squeeze between two
+        obstacles that touch only at a corner. That produced the intermittent
+        single-cell collisions on the raw RRT* tree. This walk does not cut
+        corners, so the raw path is collision-free.
+
+        obs is indexed [cy, cx] = [row, col] = [y, x] (matches CostmapAdapter).
+        """
+        res = self.map.res
+        ox  = self.map.origin_x
+        oy  = self.map.origin_y
+
+        # Fractional cell coordinates of the endpoints.
+        fx0 = (x0 - ox) / res
+        fy0 = (y0 - oy) / res
+        fx1 = (x1 - ox) / res
+        fy1 = (y1 - oy) / res
+
+        cx  = int(math.floor(fx0)); cy  = int(math.floor(fy0))
+        cx1 = int(math.floor(fx1)); cy1 = int(math.floor(fy1))
+
+        dx = fx1 - fx0
+        dy = fy1 - fy0
+
+        step_x = 1 if dx > 0 else (-1 if dx < 0 else 0)
+        step_y = 1 if dy > 0 else (-1 if dy < 0 else 0)
+
+        t_delta_x = abs(1.0 / dx) if dx != 0 else float('inf')
+        t_delta_y = abs(1.0 / dy) if dy != 0 else float('inf')
+
+        if dx > 0:
+            t_max_x = (math.floor(fx0) + 1.0 - fx0) / dx
+        elif dx < 0:
+            t_max_x = (fx0 - math.floor(fx0)) / (-dx)
+        else:
+            t_max_x = float('inf')
+
+        if dy > 0:
+            t_max_y = (math.floor(fy0) + 1.0 - fy0) / dy
+        elif dy < 0:
+            t_max_y = (fy0 - math.floor(fy0)) / (-dy)
+        else:
+            t_max_y = float('inf')
+
+        # Defensive iteration cap (manhattan cell span + slack).
+        max_steps = abs(cx1 - cx) + abs(cy1 - cy) + 2
+        for _ in range(max_steps + 1):
             if not self.map.in_bounds(cx, cy):
                 return False
-            if obs[cx, cy]:
+            if obs[cy, cx]:
                 return False
+            if cx == cx1 and cy == cy1:
+                break
+            if t_max_x < t_max_y:
+                t_max_x += t_delta_x
+                cx += step_x
+            else:
+                t_max_y += t_delta_y
+                cy += step_y
         return True
 
     def _choose_parent(self, nodes, nx, ny, default_cost, obs):
@@ -804,7 +860,7 @@ class QuadRRTPlanner:
             for ddx in range(-r, r+1):
                 for ddy in range(-r, r+1):
                     nx, ny = gcx+ddx, gcy+ddy
-                    if self.map.in_bounds(nx, ny) and not obs[nx, ny]:
+                    if self.map.in_bounds(nx, ny) and not obs[ny, nx]:
                         return nx, ny
         return None, None
 

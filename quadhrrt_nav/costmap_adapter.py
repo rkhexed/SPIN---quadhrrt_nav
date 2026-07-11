@@ -15,7 +15,8 @@ Surface used by the planner (from grep of rrt_virtual_mover.py):
     world_to_cell(x, y)      -> (cx, cy)
     cell_to_world(cx, cy)    -> (x, y)   world coord of cell centre
     in_bounds(cx, cy)        -> bool
-    inflated_mask()          -> 2D bool array, True = blocked, indexed [cx, cy]
+    inflated_mask()          -> 2D bool array, True = blocked, indexed
+                                [cy, cx] = [row, col] = [y, x] (row-major)
     _bresenham(x0,y0,x1,y1)  -> generator of (cx, cy) cells along a line
     origin_x, origin_y       -> map origin in world frame
     res                      -> metres / cell
@@ -51,8 +52,9 @@ class CostmapAdapter:
         self._lethal_threshold  = lethal_threshold
         self._unknown_is_blocked = unknown_is_blocked
 
-        # Cost grid stored as int16, shape (w, h) so that self._cost[cx, cy]
-        # follows the planner's column-major (x, y) indexing convention.
+        # Cost grid stored as int16 in the natural ROS row-major layout,
+        # shape (h, w), indexed self._cost[cy, cx] = [row, col] = [y, x].
+        # (No transpose at the source — the planner's readers use [cy, cx].)
         self._cost = None
         self._mask = None   # cached inflated_mask() result, invalidated on update
 
@@ -67,8 +69,9 @@ class CostmapAdapter:
         self.origin_y = info.origin.position.y
 
         # OccupancyGrid.data is row-major: index = row * width + col.
-        # reshape -> [row, col]; transpose -> [col, row] == [cx, cy].
-        data = np.asarray(msg.data, dtype=np.int16).reshape(self.h, self.w).T
+        # Keep that layout: reshape -> [row, col] == [cy, cx] == [y, x].
+        # Readers in planner_core.py index the mask as obs[cy, cx] to match.
+        data = np.asarray(msg.data, dtype=np.int16).reshape(self.h, self.w)
         self._cost = data
         self._mask = None   # invalidate cache
 
@@ -92,7 +95,8 @@ class CostmapAdapter:
 
     def inflated_mask(self):
         """
-        Binary blocked mask, True = blocked. Indexed [cx, cy].
+        Binary blocked mask, True = blocked. Indexed [cy, cx] = [row, col]
+        = [y, x] (row-major — same layout as the source OccupancyGrid).
 
         Pure threshold of the ALREADY-inflated Nav2 costmap — no extra dilation
         (see module docstring: avoid double inflation).
