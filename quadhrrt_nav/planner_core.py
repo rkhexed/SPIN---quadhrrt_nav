@@ -808,18 +808,22 @@ class QuadRRTPlanner:
                         return nx, ny
         return None, None
 
-    @staticmethod
-    def smooth_path(waypoints, iterations=50):
-        """Simple path smoothing by averaging neighbours."""
+    def smooth_path(self, waypoints, iterations=50):
+        """Collision-aware smoothing: average neighbours, but reject any move
+        that would push a segment through an obstacle (keeps the raw point)."""
         if len(waypoints) < 3:
             return waypoints
+        obs = self.map.inflated_mask()
         pts = list(waypoints)
         for _ in range(iterations):
             for i in range(1, len(pts) - 1):
-                pts[i] = (
+                cand = (
                     (pts[i-1][0] + pts[i][0] + pts[i+1][0]) / 3.0,
                     (pts[i-1][1] + pts[i][1] + pts[i+1][1]) / 3.0,
                 )
+                if (self._collision_free(pts[i-1][0], pts[i-1][1], cand[0], cand[1], obs)
+                        and self._collision_free(cand[0], cand[1], pts[i+1][0], pts[i+1][1], obs)):
+                    pts[i] = cand
         return pts
 
     def shortcut_smooth(self, path, iterations=50):
