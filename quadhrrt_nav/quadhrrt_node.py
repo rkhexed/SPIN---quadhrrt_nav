@@ -47,6 +47,9 @@ class QuadHRRTNode(Node):
         self.declare_parameter('controller_id', '')
         self.declare_parameter('goal_checker_id', '')
         self.declare_parameter('lethal_threshold', LETHAL_THRESHOLD)
+        # Bounded latency + evaluation logging (Step 2 wrap-up).
+        self.declare_parameter('plan_time_budget', 1.0)   # seconds
+        self.declare_parameter('metrics_csv', '')          # '' => disabled
 
         self.costmap_topic   = self.get_parameter('costmap_topic').value
         self.goal_topic      = self.get_parameter('goal_topic').value
@@ -55,10 +58,17 @@ class QuadHRRTNode(Node):
         self.controller_id   = self.get_parameter('controller_id').value
         self.goal_checker_id = self.get_parameter('goal_checker_id').value
         lethal_threshold     = int(self.get_parameter('lethal_threshold').value)
+        plan_time_budget     = float(self.get_parameter('plan_time_budget').value)
+        metrics_csv          = self.get_parameter('metrics_csv').value or None
 
         # ── planner + costmap adapter ───────────────────────────
         self.adapter = CostmapAdapter(lethal_threshold=lethal_threshold)
-        self.planner = QuadRRTPlanner(self.adapter)
+        self.planner = QuadRRTPlanner(
+            self.adapter,
+            metrics_csv=metrics_csv,
+            plan_time_budget=plan_time_budget)
+        if metrics_csv:
+            self.get_logger().info(f"Logging plan metrics to {metrics_csv}")
 
         # ── TF (for start pose) ─────────────────────────────────
         self.tf_buffer   = tf2_ros.Buffer()

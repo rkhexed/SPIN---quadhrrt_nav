@@ -31,6 +31,11 @@ GOAL_TOLERANCE   = 0.5
 USE_RRT_STAR     = True
 RRT_STAR_RADIUS  = 1.0
 
+# Wall-clock budget per plan() call. Bounds latency on hard/near-unsolvable
+# queries (which would otherwise burn all MAX_ITERATIONS). A plan that hits the
+# budget returns [] with self.timed_out=True — still logged as a metric.
+PLAN_TIME_BUDGET_S = 1.0
+
 # HMA-RRT* parameters
 CORRIDOR_FACTOR      = 0.4
 MIN_CORRIDOR_WIDTH   = 2.0
@@ -212,14 +217,21 @@ class RRTNode:
 
 class QuadRRTPlanner:
 
-    def __init__(self, occ_map):
+    def __init__(self, occ_map, metrics_csv=None,
+                 plan_time_budget=PLAN_TIME_BUDGET_S):
         self.map = occ_map
         self.quadtree = None
         self.latest_nodes = []
         print("[INFO] QuadRRTPlanner initialized")
+        # Metric logging / latency bound
+        self.metrics_csv = metrics_csv          # path to append per-plan CSV rows
+        self.plan_time_budget = plan_time_budget
         # HMA-RRT* metrics
         self.plan_time = 0.0
         self.total_nodes = 0
+        self.iterations_used = 0
+        self.success = False
+        self.timed_out = False
 
         self.raw_path_length = 0.0
         self.smoothed_path_length = 0.0
@@ -542,6 +554,9 @@ class QuadRRTPlanner:
 
         self.plan_time = 0.0
         self.total_nodes = 0
+        self.iterations_used = 0
+        self.success = False
+        self.timed_out = False
 
         self.raw_path_length = 0.0
         self.smoothed_path_length = 0.0
@@ -575,12 +590,22 @@ class QuadRRTPlanner:
         scx, scy = self.map.world_to_cell(sx, sy)
         gcx, gcy = self.map.world_to_cell(gx, gy)
 
-        if not self.map.in_bounds(scx, scy):
-            return []
+        # Relocate the START if it is out of bounds or lands on a blocked cell,
+        # mirroring the goal handling below (e.g. localization jitter parking the
+        # reported pose just inside an inflated wall). Closes the start/goal
+        # asymmetry: previously only the goal was relocated.
+        if not self.map.in_bounds(scx, scy) or obs[scy, scx]:
+            scx, scy = self._free_near(scx, scy, obs)
+            if scx is None:
+                return self._finish_failure(
+                    start_world, goal_world, start_time, "start_unreachable")
+            sx, sy = self.map.cell_to_world(scx, scy)
+
         if not self.map.in_bounds(gcx, gcy) or obs[gcy, gcx]:
             gcx, gcy = self._free_near(gcx, gcy, obs)
             if gcx is None:
-                return []
+                return self._finish_failure(
+                    start_world, goal_world, start_time, "goal_unreachable")
             gx, gy = self.map.cell_to_world(gcx, gcy)
 
         # Map bounds in world coords
@@ -598,10 +623,14 @@ class QuadRRTPlanner:
         self._init_sampling_grid(sx, sy, gx, gy, obs)
 
 
-        for _ in range(MAX_ITERATIONS):
-            # Sample
+        for _it in range(MAX_ITERATIONS):
+            self.iterations_used = _it + 1
+            # Bounded latency: stop searching once the wall-clock budget is spent.
+            if time.time() - start_time > self.plan_time_budget:
+                self.timed_out = True
+                break
 
-           # Sample — Component 1: grid-based dynamic sampling
+            # Sample — Component 1: grid-based dynamic sampling
             rx, ry = self._sample_from_grid()
 
             # Nearest node
@@ -643,7 +672,10 @@ class QuadRRTPlanner:
                 break
 
         if goal_node_idx is None:
-            return []
+            self.total_nodes = len(nodes)
+            return self._finish_failure(
+                start_world, goal_world, start_time,
+                "timeout" if self.timed_out else "no_path")
 
 
         path = self._extract_path(nodes, goal_node_idx)
@@ -675,7 +707,52 @@ class QuadRRTPlanner:
         )
         print(f"[RRT*] Rewires: {self.rewire_count}")
 
+        self.success = True
+        self._log_metrics(start_world, goal_world, "success")
         return path
+
+    def _finish_failure(self, start_world, goal_world, start_time, reason):
+        """Record a failed plan (no path / timeout / unreachable endpoint),
+        log the metric row, and return the empty path the planner expects."""
+        self.plan_time = time.time() - start_time
+        self.success = False
+        print(f"[RRT*] FAILED ({reason}): "
+              f"start={start_world} goal={goal_world} "
+              f"time={self.plan_time:.3f}s iters={self.iterations_used} "
+              f"nodes={self.total_nodes}")
+        self._log_metrics(start_world, goal_world, reason)
+        return []
+
+    def _log_metrics(self, start_world, goal_world, reason):
+        """Append one CSV row per planning attempt for the paper's evaluation
+        section. No-op unless a metrics_csv path was supplied. Hard queries
+        (timeout / unreachable) are logged too, so latency spikes stay visible."""
+        if not self.metrics_csv:
+            return
+        import csv, os
+        header = ["wall_time", "start_x", "start_y", "goal_x", "goal_y",
+                  "success", "timed_out", "reason", "plan_time_s",
+                  "iterations", "nodes", "rewires",
+                  "raw_length_m", "smoothed_length_m"]
+        row = [
+            f"{time.time():.3f}",
+            f"{start_world[0]:.3f}", f"{start_world[1]:.3f}",
+            f"{goal_world[0]:.3f}", f"{goal_world[1]:.3f}",
+            int(self.success), int(self.timed_out), reason,
+            f"{self.plan_time:.4f}", self.iterations_used, self.total_nodes,
+            self.rewire_count,
+            f"{self.raw_path_length:.3f}", f"{self.smoothed_path_length:.3f}",
+        ]
+        try:
+            need_header = (not os.path.exists(self.metrics_csv)
+                           or os.path.getsize(self.metrics_csv) == 0)
+            with open(self.metrics_csv, "a", newline="") as f:
+                wtr = csv.writer(f)
+                if need_header:
+                    wtr.writerow(header)
+                wtr.writerow(row)
+        except OSError as e:
+            print(f"[RRT*] metrics_csv write failed ({self.metrics_csv}): {e}")
 
     def get_tree_edges(self, nodes):
         """Return list of (x0,y0,x1,y1) for RViz tree visualisation."""
