@@ -36,6 +36,14 @@ RRT_STAR_RADIUS  = 1.0
 # budget returns [] with self.timed_out=True — still logged as a metric.
 PLAN_TIME_BUDGET_S = 1.0
 
+# Anytime RRT*: after the FIRST goal connection, keep optimizing (so the semantic
+# cost term can actually reshape the path via rewiring) until either the time
+# budget is hit OR the best goal-path cost stops improving for this many
+# consecutive iterations. Bounds latency on easy queries while still giving the
+# cost term room to route around penalized regions.
+OPT_STALL_ITERS = 700
+OPT_IMPROVE_EPS = 1e-3      # min cost drop that counts as "improvement"
+
 # HMA-RRT* parameters
 CORRIDOR_FACTOR      = 0.4
 MIN_CORRIDOR_WIDTH   = 2.0
@@ -48,6 +56,18 @@ RANDOM_SAMPLE_RATE   = 0.05
 GRID_N           = 10      # 10×10 grid over entire map
 GRID_DELTA       = 0.1     # attenuation factor for selection count
 GRID_P_BASE      = 0.05    # base probability every cell starts with
+
+# ── Semantic cost injection (Step 3 — the novel contribution) ──
+# Abaza's published soft-penalty concept, translated from a Nav2 route GRAPH into
+# QuadHRRT*'s continuous COST FUNCTION. The penalty rides on the RRT* edge cost
+# (parent-selection + rewiring), so the planner *provably* prefers paths that
+# avoid penalized regions while still traversing them if there's no better option.
+# It is NOT a sampling bias. All three knobs are tunable (constructor params).
+SEMANTIC_WEIGHT  = 5.0     # global scale (mirrors Abaza's PenaltyScorer weight)
+SEMANTIC_SIGMA   = 0.5     # metres: Gaussian falloff width of a detection
+# Allowlist (Abaza-style): only these YOLO classes matter; class -> weight.
+# w > 0 repels (hazard), w < 0 attracts (task-relevant target). Others ignored.
+SEMANTIC_CLASSES = {"person": +1.0}
 # ──────────────────────────────────────────────────────────────
 
 
@@ -218,7 +238,11 @@ class RRTNode:
 class QuadRRTPlanner:
 
     def __init__(self, occ_map, metrics_csv=None,
-                 plan_time_budget=PLAN_TIME_BUDGET_S):
+                 plan_time_budget=PLAN_TIME_BUDGET_S,
+                 semantic_weight=SEMANTIC_WEIGHT,
+                 semantic_sigma=SEMANTIC_SIGMA,
+                 semantic_classes=None,
+                 force_anytime=False):
         self.map = occ_map
         self.quadtree = None
         self.latest_nodes = []
@@ -226,6 +250,27 @@ class QuadRRTPlanner:
         # Metric logging / latency bound
         self.metrics_csv = metrics_csv          # path to append per-plan CSV rows
         self.plan_time_budget = plan_time_budget
+
+        # ── Semantic cost injection (Step 3) ──
+        # Tunable knobs; all documented at module level.
+        self.SEMANTIC_WEIGHT  = semantic_weight
+        self.SEMANTIC_SIGMA   = semantic_sigma
+        self.SEMANTIC_CLASSES = (dict(SEMANTIC_CLASSES) if semantic_classes is None
+                                 else dict(semantic_classes))
+        # Detections in WORLD coords: list of (class_name, wx, wy). Empty => the
+        # semantic term is 0 and the planner behaves exactly as in Steps 1–2.
+        # Hardcoded/injectable for now (no live YOLO on the VM yet).
+        self.detections = []
+
+        # Anytime optimization control (see plan()).
+        #   Deployment default (conditional): anytime is ON only when a semantic
+        #   penalty is active (detections present) — otherwise we keep Step 2's
+        #   fast break-at-first-goal so no-semantics latency is unchanged.
+        #   force_anytime=True forces it ON regardless of detections, so the
+        #   evaluation harness can compare "planner, no semantics" (B) vs
+        #   "planner + semantics" (C) under IDENTICAL optimization — isolating
+        #   the semantic effect (mirrors Abaza's baseline-vs-semantic structure).
+        self.force_anytime = force_anytime
         # HMA-RRT* metrics
         self.plan_time = 0.0
         self.total_nodes = 0
@@ -246,8 +291,47 @@ class QuadRRTPlanner:
         self.grid_counts = {}   # how many times each cell has been sampled
         self.grid_nc     = 0    # obstacle count intersecting start-goal line
 
+    # ══════════════════════════════════════════════════════
+    #  Step 3 — Semantic cost injection
+    # ══════════════════════════════════════════════════════
+    def set_detections(self, detections):
+        """Inject semantic detections. `detections` is a list of
+        (class_name, world_x, world_y). World coords (metres), same frame as
+        start/goal. Pass [] to disable the semantic term."""
+        self.detections = list(detections) if detections else []
 
+    def _edge_cost(self, x0, y0, x1, y1):
+        """Geometric distance + semantic penalty (Abaza's soft-penalty concept in
+        continuous cost space). Positive penalty = repel (hazard); negative =
+        attract (task-relevant). Never let total edge cost go <= 0 (RRT*
+        optimality assumes non-negative edge costs)."""
+        d = math.hypot(x1 - x0, y1 - y0)
+        sem = self._semantic_penalty(x0, y0, x1, y1)   # can be + or -
+        cost = d + self.SEMANTIC_WEIGHT * sem
+        return max(cost, 1e-6)                          # clamp: cost stays positive
 
+    def _semantic_penalty(self, x0, y0, x1, y1):
+        """Accumulate semantic influence along the edge from detected objects.
+        Samples points along the segment (~every 10 cm); each nearby detection
+        adds (repel, w>0) or subtracts (attract, w<0) with Gaussian falloff by
+        distance. Normalized by sample count => per-unit, not per-length."""
+        if not self.detections:
+            return 0.0
+        d = math.hypot(x1 - x0, y1 - y0)
+        n = max(2, int(d / 0.10))        # sample edge every ~10 cm
+        two_sigma_sq = 2.0 * self.SEMANTIC_SIGMA ** 2
+        total = 0.0
+        for t in range(n + 1):
+            px = x0 + (x1 - x0) * t / n
+            py = y0 + (y1 - y0) * t / n
+            for (cls, ox, oy) in self.detections:
+                w = self.SEMANTIC_CLASSES.get(cls)
+                if w is None:            # not a semantically-relevant class -> ignore
+                    continue
+                dist = math.hypot(px - ox, py - oy)
+                influence = math.exp(-(dist ** 2) / two_sigma_sq)
+                total += w * influence   # w>0 repel (person), w<0 attract (target)
+        return total / (n + 1)           # normalize by samples (per-unit)
 
     # ══════════════════════════════════════════════════════
 #  Component 1 — Grid-Based Dynamic Sampling (Paper §3.1)
@@ -618,7 +702,17 @@ class QuadRRTPlanner:
         self.quadtree.insert(
         QuadTreeNode(sx, sy, 0)
         )
-        goal_node_idx = None
+        # Anytime RRT*: collect EVERY node that can connect to the goal, and keep
+        # optimizing after the first solution. The semantic penalty only reshapes
+        # the path through continued _choose_parent/_rewire cost minimization — a
+        # plain break-at-first-goal never lets the cost term act. Bounded by the
+        # time budget, with a convergence early-exit so easy queries stay fast.
+        goal_indices = []
+        best_goal_cost = float('inf')
+        stall = 0
+        first_solution_it = None
+        # Anytime ON when a semantic penalty is active, or forced by the harness.
+        anytime = bool(self.detections) or self.force_anytime
         # ── Component 1: build grid probability table once ──
         self._init_sampling_grid(sx, sy, gx, gy, obs)
 
@@ -644,8 +738,8 @@ class QuadRRTPlanner:
             if not self._collision_free(nearest.x, nearest.y, nx, ny, obs):
                 continue
 
-            new_cost = nearest.cost + math.hypot(nx - nearest.x,
-                                                  ny - nearest.y)
+            new_cost = nearest.cost + self._edge_cost(nearest.x, nearest.y,
+                                                       nx, ny)
 
             if USE_RRT_STAR:
                 # RRT*: find neighbours and choose best parent
@@ -666,17 +760,48 @@ class QuadRRTPlanner:
                 )
 
 
-            # Goal check
-            if ( math.hypot(nx-gx, ny-gy) <= GOAL_TOLERANCE and self._collision_free(nx, ny, gx, gy, obs)):
-                goal_node_idx = len(nodes) - 1
-                break
+            # Goal check: this node can reach the goal.
+            if (math.hypot(nx - gx, ny - gy) <= GOAL_TOLERANCE
+                    and self._collision_free(nx, ny, gx, gy, obs)):
+                goal_indices.append(len(nodes) - 1)
+                if first_solution_it is None:
+                    first_solution_it = _it
+                # Deployment fast-path: no semantic penalty and not forced ->
+                # behave exactly as Steps 1–2 (return the first solution).
+                if not anytime:
+                    break
 
-        if goal_node_idx is None:
+            # Anytime convergence: once a solution exists, stop early if the best
+            # goal-path cost hasn't improved for ~OPT_STALL_ITERS iterations.
+            # Checked every 25 iters; goal_indices is pruned to the 20 cheapest so
+            # the recompute stays O(1)-ish (captures rewiring-driven gains too).
+            if anytime and goal_indices and (_it % 25 == 0):
+                scored = sorted(
+                    goal_indices,
+                    key=lambda i: nodes[i].cost + self._edge_cost(
+                        nodes[i].x, nodes[i].y, gx, gy))
+                goal_indices = scored[:20]
+                cur_best = (nodes[goal_indices[0]].cost + self._edge_cost(
+                    nodes[goal_indices[0]].x, nodes[goal_indices[0]].y, gx, gy))
+                if cur_best < best_goal_cost - OPT_IMPROVE_EPS:
+                    best_goal_cost = cur_best
+                    stall = 0
+                else:
+                    stall += 25
+                    if stall >= OPT_STALL_ITERS:
+                        break
+
+        if not goal_indices:
             self.total_nodes = len(nodes)
             return self._finish_failure(
                 start_world, goal_world, start_time,
                 "timeout" if self.timed_out else "no_path")
 
+        # Pick the lowest-cost goal connection using FINAL (post-rewiring) costs.
+        goal_node_idx = min(
+            goal_indices,
+            key=lambda i: nodes[i].cost + self._edge_cost(nodes[i].x, nodes[i].y,
+                                                          gx, gy))
 
         path = self._extract_path(nodes, goal_node_idx)
         raw_length = self.path_length(path)
@@ -862,7 +987,7 @@ class QuadRRTPlanner:
                 continue
             if not self._collision_free(node.x, node.y, nx, ny, obs):
                 continue
-            c = node.cost + d
+            c = node.cost + self._edge_cost(node.x, node.y, nx, ny)
             if c < best_cost:
                 best_cost   = c
                 best_parent = i
@@ -870,7 +995,7 @@ class QuadRRTPlanner:
             # Fall back to nearest
             best_parent = self._nearest(nodes, nx, ny)
             p = nodes[best_parent]
-            best_cost = p.cost + math.hypot(p.x - nx, p.y - ny)
+            best_cost = p.cost + self._edge_cost(p.x, p.y, nx, ny)
         return RRTNode(nx, ny, parent=best_parent, cost=best_cost), best_parent
 
     def _rewire(self, nodes, new_idx, obs):
@@ -891,7 +1016,8 @@ class QuadRRTPlanner:
 
             if d > radius:
                 continue
-            new_cost = new_node.cost + d
+            new_cost = new_node.cost + self._edge_cost(
+                new_node.x, new_node.y, node.x, node.y)
             if new_cost < node.cost and \
                self._collision_free(new_node.x, new_node.y,
                                     node.x, node.y, obs):
@@ -912,9 +1038,9 @@ class QuadRRTPlanner:
 
             if node.parent == parent_idx:
 
-                edge_cost = math.hypot(
-                    node.x - parent.x,
-                    node.y - parent.y
+                edge_cost = self._edge_cost(
+                    parent.x, parent.y,
+                    node.x, node.y
                 )
 
                 node.cost = parent.cost + edge_cost

@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# ROS2 build artifacts
+build/
+install/
+log/
+
+# OS / editor
+.DS_Store
+*.swp

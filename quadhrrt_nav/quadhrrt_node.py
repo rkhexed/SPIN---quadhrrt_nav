@@ -50,6 +50,17 @@ class QuadHRRTNode(Node):
         # Bounded latency + evaluation logging (Step 2 wrap-up).
         self.declare_parameter('plan_time_budget', 1.0)   # seconds
         self.declare_parameter('metrics_csv', '')          # '' => disabled
+        # ── Step 3: semantic cost injection ──
+        self.declare_parameter('semantic_weight', 5.0)
+        self.declare_parameter('semantic_sigma', 0.5)
+        # force_anytime: deployment leaves this False (anytime auto-ON only when
+        # detections are present). The evaluation harness sets it True to run
+        # condition B (planner, no semantics) under the SAME optimization as
+        # condition C (planner + semantics), isolating the semantic effect.
+        self.declare_parameter('force_anytime', False)
+        # Static test detections (no live YOLO yet): "class:x:y" strings in world
+        # coords, e.g. ['person:1.0:2.0']. Empty => no semantics.
+        self.declare_parameter('detections', [''])
 
         self.costmap_topic   = self.get_parameter('costmap_topic').value
         self.goal_topic      = self.get_parameter('goal_topic').value
@@ -60,15 +71,29 @@ class QuadHRRTNode(Node):
         lethal_threshold     = int(self.get_parameter('lethal_threshold').value)
         plan_time_budget     = float(self.get_parameter('plan_time_budget').value)
         metrics_csv          = self.get_parameter('metrics_csv').value or None
+        semantic_weight      = float(self.get_parameter('semantic_weight').value)
+        semantic_sigma       = float(self.get_parameter('semantic_sigma').value)
+        force_anytime        = bool(self.get_parameter('force_anytime').value)
 
         # ── planner + costmap adapter ───────────────────────────
         self.adapter = CostmapAdapter(lethal_threshold=lethal_threshold)
         self.planner = QuadRRTPlanner(
             self.adapter,
             metrics_csv=metrics_csv,
-            plan_time_budget=plan_time_budget)
+            plan_time_budget=plan_time_budget,
+            semantic_weight=semantic_weight,
+            semantic_sigma=semantic_sigma,
+            force_anytime=force_anytime)
         if metrics_csv:
             self.get_logger().info(f"Logging plan metrics to {metrics_csv}")
+
+        # Load any static test detections (world coords).
+        dets = self.parse_detections(self.get_parameter('detections').value)
+        if dets:
+            self.planner.set_detections(dets)
+            self.get_logger().info(
+                f"Semantic: {len(dets)} detection(s) loaded, "
+                f"weight={semantic_weight}, sigma={semantic_sigma}.")
 
         # ── TF (for start pose) ─────────────────────────────────
         self.tf_buffer   = tf2_ros.Buffer()
@@ -141,6 +166,23 @@ class QuadHRRTNode(Node):
         self.send_follow_path(path_msg)
 
     # ── helpers ─────────────────────────────────────────────────
+    def parse_detections(self, raw):
+        """Parse ['class:x:y', ...] param into [(class, x, y), ...] world coords.
+        Empty/blank entries are ignored. Malformed entries are warned + skipped."""
+        dets = []
+        for item in (raw or []):
+            if not item or not item.strip():
+                continue
+            parts = item.split(':')
+            if len(parts) != 3:
+                self.get_logger().warn(f"Bad detection '{item}' (want class:x:y).")
+                continue
+            try:
+                dets.append((parts[0], float(parts[1]), float(parts[2])))
+            except ValueError:
+                self.get_logger().warn(f"Bad detection coords in '{item}'.")
+        return dets
+
     def lookup_start(self):
         """Robot position in the global frame from TF, or None on failure."""
         try:
