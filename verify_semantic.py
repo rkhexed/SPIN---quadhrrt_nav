@@ -1,34 +1,27 @@
 #!/usr/bin/env python3
 """
-verify_semantic.py — verify Step 3 semantic cost injection in QuadHRRT*.
+verify_semantic.py - check the semantic cost injection in QuadHRRT*.
 
-Runs WITHOUT ROS2 (pure numpy/PIL/yaml), reusing verify_collisions.py's map
-loader. Acceptance per step3_semantic_spec.md — the semantic path must:
+Runs without ROS (numpy/PIL/yaml), reusing verify_collisions.py's map loader.
+Builds a scenario in the map's most open region and checks the semantic path:
 
-  1. be FOUND               (len(path) > 1; fail loudly on empty — the spec's
-                             "empty path trivially passes" trap)
-  2. be COLLISION-FREE      (0/N via the same dense [y,x] ground-truth checker)
-  3. AVOID the hazard        (min-distance to an injected "person" grows vs. the
-                             no-detection baseline)
+  1. found             (len(path) > 1; empty fails)
+  2. collision-free    (0/N via the dense [y,x] ground-truth checker)
+  3. avoids the hazard (min-distance to an injected "person" grows vs baseline)
+  4. reaches the goal  (path ends within GOAL_TOLERANCE of the goal)
 
-Plus an ATTRACTION sanity check: a negative-weight target pulls the path toward
-it (min-distance shrinks) without breaking (path found, cost stays positive).
+For (3)/(4) the hazard is placed near the goal so avoidance and arrival compete;
+the near-goal taper should let both hold at once. Weight and sigma stay at their
+defaults (not tuned to inflate avoidance). Also runs an attraction sanity check
+(a negative-weight target should pull the path in).
 
-WHY A CONTROLLED OPEN-REGION SCENARIO (not the maze diagonal):
-  Semantic avoidance can only manifest where a DETOUR exists. Abaza's soft
-  penalty is "traversable-but-discouraged": in a forced 1-wide corridor the path
-  (correctly) still goes through, so no bend is measurable there — that's a bad
-  test location, not a planner failure. So we auto-find the map's most open disk
-  and run start->goal straight across it with the hazard in the middle, where a
-  detour is unambiguously available. Because RRT* is randomized, each condition
-  is measured over several trials and compared on the MEDIAN.
+The open region is used because avoidance can only show where a detour exists; in
+a forced narrow corridor the soft penalty still traverses. RRT* is randomized, so
+each condition is measured over several trials and compared on the median.
 
-  (Anytime RRT* matters here: the semantic term only reshapes the path through
-  continued _choose_parent/_rewire cost minimization. See planner_core.plan.)
-
-USAGE:
+Usage:
   python3 verify_semantic.py --repo . --map /path/to/maze.yaml
-  # optional: --trials N --weight W --sigma S
+  # optional: --trials N --weight W --sigma S --taper T
 """
 import argparse, math, os, sys, statistics
 import numpy as np
@@ -53,7 +46,7 @@ def _load_planner_and_map(repo, map_yaml):
 
 
 def count_collisions(path, adapter, gt_yx, w, h):
-    """Dense [y,x] ground-truth collision count — identical to Step 1's checker."""
+    """Dense [y,x] ground-truth collision count (same as verify_collisions)."""
     bad = tot = 0
     for i in range(len(path) - 1):
         x0, y0 = path[i]; x1, y1 = path[i + 1]
@@ -85,9 +78,9 @@ def min_dist_to_point(path, px, py):
 
 
 def find_open_region(adapter, gt_yx, w, h):
-    """Return (wx, wy, clearance_m) of the map's most-open free cell — the centre
-    of the largest square window that contains no blocked cells. Uses an integral
-    image of the blocked mask so window emptiness is O(1)."""
+    """Return (wx, wy, clearance_m) of the map's most-open free cell: the centre
+    of the largest square window with no blocked cells. Uses an integral image of
+    the blocked mask so window emptiness is O(1)."""
     res = adapter.res
     ii = np.zeros((h + 1, w + 1), dtype=np.int32)
     ii[1:, 1:] = np.cumsum(np.cumsum(gt_yx.astype(np.int32), 0), 1)
@@ -113,17 +106,15 @@ def find_open_region(adapter, gt_yx, w, h):
 
 
 def plan_trials(PlannerCls, adapter, start, goal, detections, sem_classes,
-                weight, sigma, trials):
-    """Run `trials` plans with the given detection set. Returns (paths, empties,
-    plan_times) — only non-empty paths are kept.
-
-    force_anytime=True on EVERY planner so the baseline (B, no detections) and
-    the semantic run (C, detections) use IDENTICAL anytime optimization — the
-    ONLY difference is the semantic penalty. Otherwise a wiggly first-solution
-    baseline would confound the avoidance measurement."""
+                weight, sigma, taper, trials):
+    """Run `trials` plans with the given detections; return (paths, empties,
+    times), keeping only non-empty paths. force_anytime=True on every planner so
+    the baseline and the semantic run use the same optimization and only the
+    penalty differs."""
     paths, empties, times = [], 0, []
     for _ in range(trials):
         p = PlannerCls(adapter, semantic_weight=weight, semantic_sigma=sigma,
+                       semantic_taper_radius=taper,
                        semantic_classes=sem_classes, force_anytime=True)
         if detections:
             p.set_detections(detections)
@@ -139,7 +130,7 @@ def plan_trials(PlannerCls, adapter, start, goal, detections, sem_classes,
 def _final_verdict(ok):
     if ok:
         print("STEP 3 PASS: path FOUND + collision-free + bends away from the "
-              "hazard; attraction pulls toward the target.")
+              "hazard + REACHES the goal (taper on); attraction pulls in.")
         sys.exit(0)
     print("STEP 3 FAIL: see failing condition(s) above.")
     sys.exit(1)
@@ -152,10 +143,13 @@ def main():
     ap.add_argument('--trials', type=int, default=12)
     ap.add_argument('--weight', type=float, default=5.0)
     ap.add_argument('--sigma',  type=float, default=0.5)
+    ap.add_argument('--taper',  type=float, default=0.5,
+                    help='near-goal taper radius (m); 0 disables the taper')
     args = ap.parse_args()
 
     (CostmapAdapter, QuadRRTPlanner, adapter,
      gt_yx, (w, h)) = _load_planner_and_map(args.repo, args.map)
+    from quadhrrt_nav.planner_core import GOAL_TOLERANCE
 
     # ── Build a controlled scenario in the map's most-open region ──
     cx0, cy0, clr = find_open_region(adapter, gt_yx, w, h)
@@ -165,23 +159,32 @@ def main():
     gap = clr * 0.8
     start = (cx0 - gap, cy0)
     goal  = (cx0 + gap, cy0)
-    person = (cx0, cy0)                          # hazard in the middle
+    # hazard a fixed ~(sigma+taper) m from the goal, along the line: close enough
+    # that the goal region competes, far enough that the taper doesn't kill
+    # avoidance at the hazard. clamped to stay on the segment.
+    off = min(args.sigma + args.taper if args.taper > 0 else args.sigma + 0.5,
+              2 * gap * 0.6)
+    person = (goal[0] - off, cy0)                # on the start->goal line
+    d_pg = math.hypot(person[0] - goal[0], person[1] - goal[1])
     print("=" * 66)
     print(f"Scenario: open region centre ({cx0:.2f}, {cy0:.2f}), "
           f"clearance ~{clr:.1f} m")
     print(f"  start={start[0]:.2f},{start[1]:.2f}  "
           f"goal={goal[0]:.2f},{goal[1]:.2f}  "
           f"(straight-line gap {2*gap:.2f} m, detour available)")
-    print(f"  weight={args.weight}  sigma={args.sigma}  trials={args.trials}")
+    print(f"  person near goal: {d_pg:.2f} m from goal  "
+          f"(taper radius {args.taper:.2f} m, goal tol {GOAL_TOLERANCE:.2f} m)")
+    print(f"  weight={args.weight}  sigma={args.sigma}  taper={args.taper}  "
+          f"trials={args.trials}")
 
     overall_ok = True
 
     # ── 0. Baseline (no detections) ─────────────────────────────
     base_paths, _, base_t = plan_trials(
         QuadRRTPlanner, adapter, start, goal, None,
-        {"person": +1.0}, args.weight, args.sigma, args.trials)
+        {"person": +1.0}, args.weight, args.sigma, args.taper, args.trials)
     if not base_paths:
-        print("  FAIL: baseline produced no path — cannot test.")
+        print("  FAIL: baseline produced no path; cannot test.")
         sys.exit(1)
     base_mind = [min_dist_to_point(p, *person) for p in base_paths]
     base_med = statistics.median(base_mind)
@@ -194,7 +197,7 @@ def main():
     print(f"REPEL: person at ({person[0]:.2f}, {person[1]:.2f}) weight=+1.0")
     sem_paths, sem_empty, sem_t = plan_trials(
         QuadRRTPlanner, adapter, start, goal, [("person", *person)],
-        {"person": +1.0}, args.weight, args.sigma, args.trials)
+        {"person": +1.0}, args.weight, args.sigma, args.taper, args.trials)
 
     # (1) FOUND
     if not sem_paths:
@@ -220,6 +223,24 @@ def main():
         print(f"  AVOIDANCE: FAIL  (min-dist {base_med:.3f} -> {sem_med:.3f} m)")
         overall_ok = False
 
+    # (4) reaches goal: with the hazard near the goal, avoidance must not drag the
+    # endpoint off it. every path's final waypoint must land within GOAL_TOLERANCE.
+    def goal_gap(p):
+        return math.hypot(p[-1][0] - goal[0], p[-1][1] - goal[1])
+    base_gap = statistics.median([goal_gap(p) for p in base_paths])
+    sem_gaps = [goal_gap(p) for p in sem_paths]
+    sem_gap_med = statistics.median(sem_gaps)
+    worst_gap = max(sem_gaps)
+    if worst_gap <= GOAL_TOLERANCE:
+        print(f"  GOAL-REACHING: PASS  (end-to-goal median {sem_gap_med:.3f} m, "
+              f"worst {worst_gap:.3f} <= tol {GOAL_TOLERANCE:.2f}; "
+              f"baseline median {base_gap:.3f})")
+    else:
+        print(f"  GOAL-REACHING: FAIL  (end-to-goal worst {worst_gap:.3f} m > "
+              f"tol {GOAL_TOLERANCE:.2f}; {sum(g > GOAL_TOLERANCE for g in sem_gaps)}"
+              f"/{len(sem_gaps)} paths miss the goal)")
+        overall_ok = False
+
     # ── ATTRACTION sanity check ─────────────────────────────────
     # Target offset perpendicular to the straight line (~1 sigma), inside the
     # open disk so the path can reach it and a gradient exists.
@@ -232,7 +253,7 @@ def main():
     base_att = statistics.median([min_dist_to_point(p, tx, ty) for p in base_paths])
     att_paths, att_empty, _ = plan_trials(
         QuadRRTPlanner, adapter, start, goal, [("target", tx, ty)],
-        {"target": -att_w}, args.weight, args.sigma, args.trials)
+        {"target": -att_w}, args.weight, args.sigma, args.taper, args.trials)
     if not att_paths:
         print("  FAIL [found]: attraction produced no path.")
         overall_ok = False

@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'quadhrrt_node = quadhrrt_nav.quadhrrt_node:main',
+            'das_goal_node = quadhrrt_nav.das_goal_node:main',
         ],
     },
 )

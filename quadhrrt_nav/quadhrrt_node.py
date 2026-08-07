@@ -3,9 +3,9 @@
 """
 quadhrrt_node.py
 ----------------
-STEP 1 node: run QuadHRRT* as a standalone Nav2-integrated planning node.
+Standalone QuadHRRT* planning node integrated with Nav2.
 
-Pipeline (no semantics, no LLM yet):
+Pipeline:
     /global_costmap/costmap  (nav_msgs/OccupancyGrid)  -> CostmapAdapter
     /goal_pose               (geometry_msgs/PoseStamped)
     TF map -> base_link      -> start pose
@@ -13,8 +13,7 @@ Pipeline (no semantics, no LLM yet):
     -> nav_msgs/Path (frame 'map')
     -> FollowPath action (nav2_msgs/action/FollowPath) -> Nav2 controller drives
 
-This mirrors Abaza's ComputeRoute -> FollowPath structure. It is NOT a Nav2
-global-planner plugin.
+Not a Nav2 global-planner plugin.
 """
 
 import math
@@ -47,19 +46,18 @@ class QuadHRRTNode(Node):
         self.declare_parameter('controller_id', '')
         self.declare_parameter('goal_checker_id', '')
         self.declare_parameter('lethal_threshold', LETHAL_THRESHOLD)
-        # Bounded latency + evaluation logging (Step 2 wrap-up).
+        # latency bound + optional per-plan metrics log
         self.declare_parameter('plan_time_budget', 1.0)   # seconds
         self.declare_parameter('metrics_csv', '')          # '' => disabled
-        # ── Step 3: semantic cost injection ──
+        # semantic cost injection
         self.declare_parameter('semantic_weight', 5.0)
         self.declare_parameter('semantic_sigma', 0.5)
-        # force_anytime: deployment leaves this False (anytime auto-ON only when
-        # detections are present). The evaluation harness sets it True to run
-        # condition B (planner, no semantics) under the SAME optimization as
-        # condition C (planner + semantics), isolating the semantic effect.
+        # penalty ramps to 0 within this distance (m) of the goal
+        self.declare_parameter('semantic_taper_radius', 0.5)
+        # force anytime optimization on even with no detections (fair no-semantics
+        # vs semantics comparison)
         self.declare_parameter('force_anytime', False)
-        # Static test detections (no live YOLO yet): "class:x:y" strings in world
-        # coords, e.g. ['person:1.0:2.0']. Empty => no semantics.
+        # static test detections: "class:x:y" world coords, e.g. ['person:1.0:2.0']
         self.declare_parameter('detections', [''])
 
         self.costmap_topic   = self.get_parameter('costmap_topic').value
@@ -73,6 +71,7 @@ class QuadHRRTNode(Node):
         metrics_csv          = self.get_parameter('metrics_csv').value or None
         semantic_weight      = float(self.get_parameter('semantic_weight').value)
         semantic_sigma       = float(self.get_parameter('semantic_sigma').value)
+        semantic_taper_radius= float(self.get_parameter('semantic_taper_radius').value)
         force_anytime        = bool(self.get_parameter('force_anytime').value)
 
         # ── planner + costmap adapter ───────────────────────────
@@ -83,6 +82,7 @@ class QuadHRRTNode(Node):
             plan_time_budget=plan_time_budget,
             semantic_weight=semantic_weight,
             semantic_sigma=semantic_sigma,
+            semantic_taper_radius=semantic_taper_radius,
             force_anytime=force_anytime)
         if metrics_csv:
             self.get_logger().info(f"Logging plan metrics to {metrics_csv}")

@@ -1,0 +1,15 @@
+# quadhrrt_nav pure-Python dependencies (pip-installable, no ROS needed).
+# Developed and tested on Python 3.12.3.
+#   pip install -r requirements.txt
+#
+# These cover the planner math and the offline verify scripts, which all run
+# without a ROS2/Nav2 environment.
+#
+# The ROS2/Nav2 libraries the live nodes need (rclpy, nav_msgs, geometry_msgs,
+# nav2_msgs, std_msgs, tf2_ros) are not pip packages. They come from your ROS2
+# install (see the README). requirements.txt cannot install them.
+
+numpy>=1.24          # planner_core, costmap_adapter, verify scripts (always needed)
+requests>=2.28       # das_goal_node LLM call (live node only)
+pyyaml>=6.0          # verify scripts: read map .yaml (offline only)
+pillow>=9.0          # verify scripts: read map .pgm (offline only)
